@@ -1,0 +1,74 @@
+name: ios-preview
+on:
+  workflow_dispatch:
+    inputs:
+      target_url: { required: true,  type: string }
+      app_name:   { required: true,  type: string, default: 'WrapApp Preview' }
+      bundle_id:  { required: true,  type: string, default: 'org.creativetechniques.wrapapp.preview' }
+      icon_url:   { required: false, type: string, default: '' }
+
+jobs:
+  preview:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Inject config
+        env:
+          URL:  ${{ inputs.target_url }}
+          NAME: ${{ inputs.app_name }}
+        run: |
+          sed -e "s|__URL__|$URL|"  WrapApp/Config.swift.tpl > WrapApp/Config.swift
+          sed -e "s|__DISPLAY_NAME__|$NAME|" WrapApp/Info.plist.tpl > WrapApp/Info.plist
+
+      - name: Generate icons (sips = macOS built-in, no deps)
+        if: ${{ inputs.icon_url != '' }}
+        run: |
+          curl -sL "${{ inputs.icon_url }}" -o /tmp/src.png
+          A=WrapApp/Assets.xcassets/AppIcon.appiconset && mkdir -p "$A"
+          for s in 120 180 1024; do sips -z $s $s /tmp/src.png --out "$A/icon-$s.png" >/dev/null; done
+          cat > "$A/Contents.json" <<'JSON'
+          {"images":[
+            {"size":"60x60","idiom":"iphone","filename":"icon-120.png","scale":"2x"},
+            {"size":"60x60","idiom":"iphone","filename":"icon-180.png","scale":"3x"},
+            {"size":"1024x1024","idiom":"ios-marketing","filename":"icon-1024.png","scale":"1x"}],
+           "info":{"version":1,"author":"wrapapp"}}
+          JSON
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build device .app (unsigned)
+        run: |
+          xcodebuild -project WrapApp.xcodeproj -scheme WrapApp -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" build
+
+      - name: Package unsigned .ipa (for future Sideloadly testing)
+        run: |
+          mkdir -p stage/Payload
+          cp -R build/Build/Products/Release-iphoneos/WrapApp.app stage/Payload/
+          (cd stage && zip -qr ../WrapApp-unsigned.ipa Payload)
+
+      - name: Simulator smoke-test + screenshot
+        run: |
+          xcodebuild -project WrapApp.xcodeproj -scheme WrapApp -configuration Release \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath simbuild \
+            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" build
+          UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin);print([r['udid'] for k in d['devices'] for r in d['devices'][k] if 'iPhone' in r['name']][0])")
+          xcrun simctl boot $UDID || true
+          xcrun simctl install booted simbuild/Build/Products/Release-iphonesimulator/WrapApp.app
+          xcrun simctl launch booted "${{ inputs.bundle_id }}"
+          sleep 6
+          xcrun simctl io booted screenshot preview.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-preview-${{ github.run_id }}
+          path: |
+            WrapApp-unsigned.ipa
+            preview.png

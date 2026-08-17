@@ -1,0 +1,14 @@
+name: WrapApp
+targets:
+  WrapApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: WrapApp
+        excludes:
+          - "**/*.tpl"
+    settings:
+      base:
+        INFOPLIST_FILE: WrapApp/Info.plist
+        CODE_SIGNING_ALLOWED: NO
