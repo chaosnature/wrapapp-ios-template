@@ -1,5 +1,9 @@
 name: ios-preview
 
+# Hardened 2026-10-29. What changed and why:
+#  - every input reaches the steps ONLY through environment variables, never pasted into a shell command (${{ inputs.x }} inside `run:` allowed command injection)
+#  - the inputs are checked again here (the WrapApp server checks them too), and written into the Swift and plist files by Python with proper escaping, not by sed
+#  - the job token is read-only, and the three actions are pinned to exact commits (a moved tag cannot change what runs)
 on:
   workflow_dispatch:
     inputs:
@@ -8,33 +12,61 @@ on:
       bundle_id:  { required: true,  type: string, default: 'org.creativetechniques.wrapapp.preview' }
       icon_url:   { required: false, type: string, default: '' }
 
+permissions:
+  contents: read
+
 jobs:
   preview:
     runs-on: macos-14
     timeout-minutes: 20
+    env:
+      TARGET_URL: ${{ inputs.target_url }}
+      APP_NAME: ${{ inputs.app_name }}
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+      ICON_URL: ${{ inputs.icon_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check the inputs
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          url, name, bid, icon = (os.environ[k] for k in ('TARGET_URL', 'APP_NAME', 'BUNDLE_ID', 'ICON_URL'))
+          web = r"https://[^\s\"'`\\|<>;$^{}]{1,480}"
+          if not re.fullmatch(web, url): sys.exit('target_url is not a plain https address')
+          if icon and not re.fullmatch(web, icon): sys.exit('icon_url is not a plain https address')
+          if not re.fullmatch(r"[\w .\-]{1,30}", name): sys.exit('app_name must be 1 to 30 letters, numbers, spaces, dots, dashes or underscores')
+          if not re.fullmatch(r"[A-Za-z][A-Za-z0-9\-]*(\.[A-Za-z][A-Za-z0-9\-]*){1,5}", bid) or len(bid) > 100: sys.exit('bundle_id must look like com.name.app')
+          print('inputs look fine')
+          PY
 
       - name: Select Xcode 16
-        uses: maxim-lobanov/setup-xcode@v1
+        uses: maxim-lobanov/setup-xcode@60606e260d2fc5762a71e64e74b2174e8ea3c8bd # v1.6.0
         with:
           xcode-version: 'latest-stable'
 
       - name: Install xcodegen
         run: brew install xcodegen
 
-      - name: Inject config
-        env:
-          URL:  ${{ inputs.target_url }}
-          NAME: ${{ inputs.app_name }}
+      - name: Inject config (Python, with escaping)
         run: |
-          sed -e "s|__URL__|$URL|"  WrapApp/Config.swift.tpl > WrapApp/Config.swift
-          sed -e "s|__DISPLAY_NAME__|$NAME|" WrapApp/Info.plist.tpl > WrapApp/Info.plist
+          python3 - <<'PY'
+          import os
+          url, name = os.environ['TARGET_URL'], os.environ['APP_NAME']
+          def fill(src, dst, token, value):
+              t = open(src, encoding='utf-8').read()
+              assert t.count(token) == 1, token
+              open(dst, 'w', encoding='utf-8').write(t.replace(token, value))
+          swift = url.replace('\\', '\\\\').replace('"', '\\"')
+          xml = name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+          fill('WrapApp/Config.swift.tpl', 'WrapApp/Config.swift', '__URL__', swift)
+          fill('WrapApp/Info.plist.tpl', 'WrapApp/Info.plist', '__DISPLAY_NAME__', xml)
+          PY
 
       - name: Generate icons (sips = macOS built-in, no deps)
         if: ${{ inputs.icon_url != '' }}
         run: |
-          curl -sL "${{ inputs.icon_url }}" -o /tmp/src.png
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --max-time 30 --max-filesize 5000000 "$ICON_URL" -o /tmp/src.png
           A=WrapApp/Assets.xcassets/AppIcon.appiconset && mkdir -p "$A"
           for s in 120 180 1024; do sips -z $s $s /tmp/src.png --out "$A/icon-$s.png" >/dev/null; done
           cat > "$A/Contents.json" <<'JSON'
@@ -52,7 +84,7 @@ jobs:
         run: |
           xcodebuild -project WrapApp.xcodeproj -scheme WrapApp -configuration Release \
             -destination 'generic/platform=iOS' -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" build
+            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" build
 
       - name: Package unsigned .ipa (for future Sideloadly testing)
         run: |
@@ -64,15 +96,15 @@ jobs:
         run: |
           xcodebuild -project WrapApp.xcodeproj -scheme WrapApp -configuration Release \
             -destination 'generic/platform=iOS Simulator' -derivedDataPath simbuild \
-            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER="${{ inputs.bundle_id }}" build
+            CODE_SIGNING_ALLOWED=NO PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" build
           UDID=$(xcrun simctl list devices available -j | python3 -c "import json,sys;d=json.load(sys.stdin);print([r['udid'] for k in d['devices'] for r in d['devices'][k] if 'iPhone' in r['name']][0])")
           xcrun simctl boot $UDID || true
           xcrun simctl install booted simbuild/Build/Products/Release-iphonesimulator/WrapApp.app
-          xcrun simctl launch booted "${{ inputs.bundle_id }}"
+          xcrun simctl launch booted "$BUNDLE_ID"
           sleep 6
           xcrun simctl io booted screenshot preview.png
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ios-preview-${{ github.run_id }}
           path: |
